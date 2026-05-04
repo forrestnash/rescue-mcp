@@ -61,8 +61,9 @@ fi
 # ── 6. Build ──────────────────────────────────────────────────────────────────
 echo "[6/12] Installing npm dependencies and building..."
 cd "${APP_DIR}"
-npm ci --omit=dev 2>&1 | tail -5
+npm ci 2>&1 | tail -5
 npm run build 2>&1 | tail -10
+npm prune --omit=dev 2>&1 | tail -5
 echo "  Build complete."
 
 # ── 7. SSH key ───────────────────────────────────────────────────────────────
