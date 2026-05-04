@@ -114,8 +114,8 @@ fi
 
 # Fix ownership
 chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
-chown root:root "${CONF_DIR}"
-chmod 700 "${CONF_DIR}"
+chown root:"${APP_USER}" "${CONF_DIR}"
+chmod 750 "${CONF_DIR}"
 chown root:"${APP_USER}" "${CONF_DIR}/token" "${CONF_DIR}/ssh_id"
 chmod 640 "${CONF_DIR}/token" "${CONF_DIR}/ssh_id"
 [ -f "${CONF_DIR}/known_hosts" ] && chmod 644 "${CONF_DIR}/known_hosts"
