@@ -8,7 +8,7 @@ import { initAudit, appendAudit } from "./audit.js";
 import { runSsh, SshConfig } from "./ssh.js";
 
 // ─── Canonical service list (mirrored from watchdog.js) ────────────────────
-// Source: /Users/sanbornserver/Documents/dev/mcps/watchdog/watchdog.js
+// Source: /Users/sanbornserver/dev/mcps/watchdog/watchdog.js
 // lines 220-226, SERVICES array
 const CANONICAL_SERVICES = [
   "com.forrest.mcp.gateway",
