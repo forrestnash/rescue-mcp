@@ -8,6 +8,7 @@ APP_DIR="/opt/rescue-mcp"
 APP_USER="rescue-mcp"
 CONF_DIR="/etc/rescue-mcp"
 LOG_DIR="/var/log/rescue-mcp"
+DATA_DIR="/var/lib/rescue-mcp"
 PORT="8431"
 SSH_TARGET_HOST="100.92.96.47"
 SSH_TARGET_USER="sanbornserver"
@@ -19,7 +20,7 @@ echo "════════════════════════�
 # ── 1. System packages ───────────────────────────────────────────────────────
 echo "[1/12] Installing system packages..."
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates gnupg openssh-client logrotate jq git
+apt-get install -y -qq curl ca-certificates gnupg openssh-client logrotate jq git build-essential python3
 
 # ── 2. Node.js 20 via NodeSource ─────────────────────────────────────────────
 echo "[2/12] Installing Node.js 20..."
@@ -91,8 +92,8 @@ if [ -s "${CONF_DIR}/known_hosts" ]; then
   echo "  known_hosts populated."
 fi
 
-# ── 8. Bearer token ───────────────────────────────────────────────────────────
-echo "[8/12] Setting up bearer token..."
+# ── 8. Bearer token + OAuth env file ─────────────────────────────────────────
+echo "[8/12] Setting up bearer token and OAuth env..."
 if [ ! -f "${CONF_DIR}/token" ]; then
   TOKEN="$(openssl rand -base64 48 | tr '+/' '-_' | tr -d '=')"
   printf '%s\n' "${TOKEN}" > "${CONF_DIR}/token"
@@ -102,6 +103,23 @@ else
   echo "  Bearer token already exists."
 fi
 TOKEN="$(cat "${CONF_DIR}/token")"
+
+# OAuth passphrase env file
+if [ ! -f "${CONF_DIR}/env" ]; then
+  if [ -z "${RESCUE_OAUTH_PASSPHRASE:-}" ]; then
+    echo "ERROR: RESCUE_OAUTH_PASSPHRASE not set in environment." >&2
+    echo "       Re-run as: sudo RESCUE_OAUTH_PASSPHRASE='your-passphrase' bash deploy.sh" >&2
+    exit 1
+  fi
+  umask 077
+  cat > "${CONF_DIR}/env" <<ENVEOF
+RESCUE_OAUTH_PASSPHRASE=${RESCUE_OAUTH_PASSPHRASE}
+ENVEOF
+  chmod 640 "${CONF_DIR}/env"
+  echo "  OAuth env file created at ${CONF_DIR}/env"
+else
+  echo "  OAuth env file already exists at ${CONF_DIR}/env"
+fi
 
 # ── 9. System user ────────────────────────────────────────────────────────────
 echo "[9/12] Creating system user..."
@@ -118,13 +136,18 @@ chown root:"${APP_USER}" "${CONF_DIR}"
 chmod 750 "${CONF_DIR}"
 chown root:"${APP_USER}" "${CONF_DIR}/token" "${CONF_DIR}/ssh_id"
 chmod 640 "${CONF_DIR}/token" "${CONF_DIR}/ssh_id"
+[ -f "${CONF_DIR}/env" ] && { chown root:"${APP_USER}" "${CONF_DIR}/env"; chmod 640 "${CONF_DIR}/env"; }
 [ -f "${CONF_DIR}/known_hosts" ] && chmod 644 "${CONF_DIR}/known_hosts"
 
-# ── 10. Log directory ─────────────────────────────────────────────────────────
-echo "[10/12] Setting up log directory..."
+# ── 10. Log directory + OAuth data dir ────────────────────────────────────────
+echo "[10/12] Setting up log and data directories..."
 mkdir -p "${LOG_DIR}"
 chown "${APP_USER}:${APP_USER}" "${LOG_DIR}"
 chmod 750 "${LOG_DIR}"
+
+mkdir -p "${DATA_DIR}"
+chown "${APP_USER}:${APP_USER}" "${DATA_DIR}"
+chmod 750 "${DATA_DIR}"
 
 # logrotate config
 cat > /etc/logrotate.d/rescue-mcp <<'LOGROTATE'
@@ -165,11 +188,13 @@ Environment=SSH_KEY_PATH=${CONF_DIR}/ssh_id
 Environment=SSH_KNOWN_HOSTS=${CONF_DIR}/known_hosts
 Environment=TOKEN_PATH=${CONF_DIR}/token
 Environment=AUDIT_LOG_PATH=${LOG_DIR}/audit.log
+Environment=OAUTH_DB_PATH=${DATA_DIR}/oauth.db
+EnvironmentFile=-${CONF_DIR}/env
 # Restrict capabilities
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=${LOG_DIR}
+ReadWritePaths=${LOG_DIR} ${DATA_DIR}
 ReadOnlyPaths=${CONF_DIR} ${APP_DIR}
 
 [Install]

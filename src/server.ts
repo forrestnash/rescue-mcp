@@ -6,6 +6,7 @@ import { timingSafeEqual } from "node:crypto";
 import { loadConfig } from "./config.js";
 import { initAudit, appendAudit } from "./audit.js";
 import { runSsh, SshConfig } from "./ssh.js";
+import { buildOAuthRouter, lookupOAuthToken } from "./oauth.js";
 
 // ─── Canonical service list (mirrored from watchdog.js) ────────────────────
 // Source: /Users/sanbornserver/dev/mcps/watchdog/watchdog.js
@@ -50,15 +51,16 @@ function checkBearer(req: Request): boolean {
     ? authHeader.slice(7)
     : "";
   if (!incoming) return false;
-  // Constant-time comparison
+  // 1. Legacy static token (constant-time comparison)
   try {
     const a = Buffer.from(incoming);
     const b = Buffer.from(cfg.token);
-    if (a.length !== b.length) return false;
-    return timingSafeEqual(a, b);
+    if (a.length === b.length && timingSafeEqual(a, b)) return true;
   } catch {
-    return false;
+    // fall through to OAuth check
   }
+  // 2. OAuth access token
+  return lookupOAuthToken(incoming);
 }
 
 // ─── MCP server factory ──────────────────────────────────────────────────────
@@ -360,10 +362,19 @@ function createMcpServer(): McpServer {
 const app = express();
 app.use(express.json());
 
+// OAuth routes (no auth required — they ARE the auth)
+app.use(buildOAuthRouter());
+
 // Auth middleware — applied to /mcp only
 function requireBearer(req: Request, res: Response, next: () => void): void {
   if (!checkBearer(req)) {
-    res.status(401).json({ error: "Unauthorized" });
+    res
+      .status(401)
+      .setHeader(
+        "WWW-Authenticate",
+        `Bearer realm="rescue-mcp", resource_metadata="https://rescue-mcp.arakawa-nash.com/.well-known/oauth-protected-resource"`
+      )
+      .json({ error: "Unauthorized" });
     return;
   }
   next();
