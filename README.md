@@ -26,6 +26,7 @@ Claude.ai ──HTTPS──► rescue-mcp.arakawa-nash.com (Cloudflare Tunnel)
 | `restart_launchd_service` | Kickstart a single launchd service by name |
 | `restart_all` | Kickstart all 5 canonical Sanborn services (mirrors watchdog.js) |
 | `tail_log` | Tail a log file (whitelisted paths only) |
+| `reconnect_connector` | Reconnect a named MCP connector in claude.ai Settings → Connectors. Heals registration-drops (tool vanishes, watchdog healthy). `{ connector_name?, reconnect_all?, dry_run? }` |
 
 **Canonical service list** (mirrored from `watchdog.js`):
 - `com.forrest.mcp.gateway`
@@ -97,7 +98,7 @@ In Claude.ai → Settings → Connectors → Add MCP:
 ## Testing locally (on Sanborn)
 
 ```bash
-cd /Users/sanbornserver/Documents/dev/rescue-mcp
+cd /Users/sanbornserver/dev/rescue-mcp
 npm install && npm run build
 
 # Use loopback SSH (requires id_localhost key)

@@ -281,6 +281,93 @@ function createMcpServer(): McpServer {
     }
   );
 
+  // ── Tool: reconnect_connector ──────────────────────────────────────────────
+  server.tool(
+    "reconnect_connector",
+    "Reconnect an MCP connector in claude.ai Settings → Connectors. Drives the logged-in Chrome profile (~/.claude-skills-profile) on Sanborn via ~/bin/claude-reconnect. Use to heal a registration-drop (tool vanishes mid-session while Sanborn watchdog is healthy). Server restarts do NOT fix claude.ai-leg drops — this tool does.",
+    {
+      connector_name: z
+        .string()
+        .optional()
+        .describe(
+          "Display name of the connector to force-reconnect (e.g. 'Desktop Connector (Sanborn Server)'). Omit to reconnect only connectors currently in error state, or combine with reconnect_all=true to reconnect all."
+        ),
+      reconnect_all: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, run disconnect-reconnect on ALL custom connectors (stale-cache fix). Slow (~2-3 min for 16 connectors). Default: false."
+        ),
+      dry_run: z
+        .boolean()
+        .optional()
+        .describe(
+          "If true, show what would be done without clicking anything. Default: false."
+        ),
+    },
+    async ({ connector_name, reconnect_all = false, dry_run = false }, extra) => {
+      const start = Date.now();
+
+      // Build the claude-reconnect invocation
+      const parts: string[] = ["/Users/sanbornserver/bin/claude-reconnect"];
+      if (dry_run) parts.push("--dry-run");
+      if (reconnect_all) {
+        parts.push("--all");
+      } else if (connector_name) {
+        // Shell-safe quoting: wrap name in single quotes, escape interior single quotes
+        const safeName = connector_name.replace(/'/g, "'\\''");
+        parts.push(`'${safeName}'`);
+      }
+
+      // Capture stdout+stderr; emit exit code as last line
+      const cmd = `${parts.join(" ")} 2>&1; echo "RECONNECT_EXIT:$?"`;
+
+      // Generous timeout: headed browser + 16 connectors can take ~3 min for --all
+      const timeoutMs = reconnect_all ? 300_000 : 120_000;
+      const result = await runSsh(cmd, timeoutMs, sshCfg);
+
+      // Parse exit code from sentinel line
+      const exitMatch = result.stdout.match(/RECONNECT_EXIT:(\d+)\s*$/m);
+      const reconnectExit = exitMatch ? parseInt(exitMatch[1], 10) : result.exit_code;
+      const cleanOutput = result.stdout.replace(/RECONNECT_EXIT:\d+\s*$/m, "").trimEnd();
+
+      appendAudit({
+        ts: new Date().toISOString(),
+        tool: "reconnect_connector",
+        params_redacted: {
+          connector_name: connector_name ?? null,
+          reconnect_all,
+          dry_run,
+        },
+        exit_code: reconnectExit,
+        duration_ms: Date.now() - start,
+        remote_addr: (extra as { remoteAddr?: string }).remoteAddr ?? "unknown",
+      });
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                connector_name: connector_name ?? null,
+                reconnect_all,
+                dry_run,
+                reconnect_exit_code: reconnectExit,
+                output: cleanOutput,
+                ssh_exit_code: result.exit_code,
+                duration_ms: Date.now() - start,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+        isError: reconnectExit !== 0,
+      };
+    }
+  );
+
   // ── Tool: tail_log ─────────────────────────────────────────────────────────
   server.tool(
     "tail_log",
