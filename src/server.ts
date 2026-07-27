@@ -3,29 +3,19 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { timingSafeEqual } from "node:crypto";
-import { loadConfig } from "./config.js";
+import { loadConfig, TargetName } from "./config.js";
 import { initAudit, appendAudit } from "./audit.js";
 import { runSsh, SshConfig } from "./ssh.js";
 import { buildOAuthRouter, lookupOAuthToken } from "./oauth.js";
 
-// ─── Canonical service list (mirrored from watchdog.js) ────────────────────
-// Source: /Users/sanbornserver/dev/mcps/watchdog/watchdog.js
-// lines 220-226, SERVICES array
-const CANONICAL_SERVICES = [
-  "com.forrest.mcp.gateway",
-  "com.forrest.desktopcommander",
-  "com.forrest.mcp.tunnel",
-  "com.sanbornserver.caffeinate",
-  "com.sanbornserver.cloudflared",
-] as const;
-
-// ─── Log whitelist ──────────────────────────────────────────────────────────
-const LOG_PATH_PREFIXES = [
-  "/tmp/",
-  "/var/log/",
-  "/Users/sanbornserver/.logs/",
-  "/Users/sanbornserver/tmp/",
-];
+// ─── Target enum for zod ──────────────────────────────────────────────────────
+const TargetParam = z
+  .enum(["sanborn", "baedeker"])
+  .optional()
+  .default("sanborn")
+  .describe(
+    "Target machine: 'sanborn' (default) or 'baedeker'. Determines which host to connect to via SSH."
+  );
 
 // ─── Startup ────────────────────────────────────────────────────────────────
 process.on("uncaughtException", (err) => {
@@ -36,13 +26,17 @@ process.on("unhandledRejection", (reason) => {
 });
 
 const cfg = loadConfig();
-const sshCfg: SshConfig = {
-  host: cfg.sshHost,
-  user: cfg.sshUser,
-  keyPath: cfg.sshKeyPath,
-  knownHostsPath: cfg.sshKnownHostsPath,
-};
 initAudit(cfg.auditLogPath);
+
+/** Resolve SSH config for a target name */
+function sshFor(target: TargetName): SshConfig {
+  return cfg.targets[target].ssh;
+}
+
+/** Resolve UID for a target name */
+function uidFor(target: TargetName): number {
+  return cfg.targets[target].uid;
+}
 
 // ─── Bearer auth helper ─────────────────────────────────────────────────────
 function checkBearer(req: Request): boolean {
@@ -67,29 +61,30 @@ function checkBearer(req: Request): boolean {
 function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "rescue-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   // ── Tool: ssh_run ──────────────────────────────────────────────────────────
   server.tool(
     "ssh_run",
-    "Run an arbitrary shell command on Sanborn Server via SSH. Returns stdout, stderr, exit_code, duration_ms.",
+    "Run an arbitrary shell command on the selected target (default Sanborn) via SSH. Returns stdout, stderr, exit_code, duration_ms.",
     {
-      command: z.string().describe("Shell command to execute on Sanborn Server"),
+      command: z.string().describe("Shell command to execute on the target machine"),
       timeout_seconds: z
         .number()
         .min(1)
         .max(300)
         .optional()
         .describe("Execution timeout in seconds (default 60, max 300)"),
+      target: TargetParam,
     },
-    async ({ command, timeout_seconds }, extra) => {
+    async ({ command, timeout_seconds, target }, extra) => {
       const timeoutMs = Math.min((timeout_seconds ?? 60) * 1000, 300_000);
-      const start = Date.now();
-      const result = await runSsh(command, timeoutMs, sshCfg);
+      const result = await runSsh(command, timeoutMs, sshFor(target));
       appendAudit({
         ts: new Date().toISOString(),
         tool: "ssh_run",
+        target,
         params_redacted: { command_length: command.length },
         exit_code: result.exit_code,
         duration_ms: result.duration_ms,
@@ -99,7 +94,7 @@ function createMcpServer(): McpServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify({ ...result, target }, null, 2),
           },
         ],
       };
@@ -109,54 +104,88 @@ function createMcpServer(): McpServer {
   // ── Tool: health_check ─────────────────────────────────────────────────────
   server.tool(
     "health_check",
-    "Returns a structured health summary of Sanborn Server: tailscale status, disk usage, launchd service states, gateway/relay health, and recent system log lines.",
-    {},
-    async (_args, extra) => {
+    "Returns a structured health summary of the selected target (default Sanborn): tailscale status, disk usage, launchd service states, and target-specific service probes.",
+    {
+      target: TargetParam,
+    },
+    async ({ target }, extra) => {
       const start = Date.now();
+      const ssh = sshFor(target);
 
-      const checks = await Promise.all([
-        runSsh("tailscale status 2>&1 | head -20", 10_000, sshCfg),
-        runSsh("df -h /", 10_000, sshCfg),
+      // Common checks for all targets
+      const commonChecks = [
+        runSsh("tailscale status 2>&1 | head -20", 10_000, ssh),
+        runSsh("df -h /", 10_000, ssh),
         runSsh(
           "launchctl print gui/$(id -u) 2>/dev/null | grep -E 'com\\.forrest|com\\.sanbornserver' | head -40",
           10_000,
-          sshCfg
-        ),
-        runSsh(
-          "curl -s --max-time 5 http://localhost:8430/health 2>&1 || echo 'not reachable'",
-          10_000,
-          sshCfg
-        ),
-        runSsh(
-          "curl -s --max-time 5 http://localhost:8420/health 2>&1 || echo 'not reachable'",
-          10_000,
-          sshCfg
+          ssh
         ),
         runSsh(
           "tail -n 20 /var/log/system.log 2>/dev/null || echo 'not available'",
           10_000,
-          sshCfg
+          ssh
         ),
-      ]);
+      ];
 
-      const [tsStatus, diskDf, launchd, claudeRelay, mcpGateway, syslog] =
-        checks;
+      // Target-specific port probes
+      if (target === "sanborn") {
+        commonChecks.push(
+          runSsh(
+            "curl -s --max-time 5 http://localhost:8430/health 2>&1 || echo 'not reachable'",
+            10_000,
+            ssh
+          ),
+          runSsh(
+            "curl -s --max-time 5 http://localhost:8420/health 2>&1 || echo 'not reachable'",
+            10_000,
+            ssh
+          ),
+        );
+      } else {
+        // Baedeker: check uptime and hostname instead of Sanborn-specific ports
+        commonChecks.push(
+          runSsh("hostname; uptime", 10_000, ssh),
+          runSsh("sw_vers 2>/dev/null || echo 'not macOS'", 10_000, ssh),
+        );
+      }
 
-      const summary = {
-        tailscale_status: tsStatus.stdout.trim() || tsStatus.stderr.trim(),
-        disk_df_root: diskDf.stdout.trim(),
-        launchd_services: launchd.stdout.trim(),
-        claude_relay_8430: claudeRelay.stdout.trim(),
-        mcp_gateway_8420: mcpGateway.stdout.trim(),
-        system_log_tail: syslog.stdout.trim(),
-        check_duration_ms: Date.now() - start,
-      };
+      const results = await Promise.all(commonChecks);
+
+      let summary: Record<string, unknown>;
+
+      if (target === "sanborn") {
+        const [tsStatus, diskDf, launchd, syslog, claudeRelay, mcpGateway] = results;
+        summary = {
+          target,
+          tailscale_status: tsStatus.stdout.trim() || tsStatus.stderr.trim(),
+          disk_df_root: diskDf.stdout.trim(),
+          launchd_services: launchd.stdout.trim(),
+          claude_relay_8430: claudeRelay.stdout.trim(),
+          mcp_gateway_8420: mcpGateway.stdout.trim(),
+          system_log_tail: syslog.stdout.trim(),
+          check_duration_ms: Date.now() - start,
+        };
+      } else {
+        const [tsStatus, diskDf, launchd, syslog, hostInfo, swVers] = results;
+        summary = {
+          target,
+          tailscale_status: tsStatus.stdout.trim() || tsStatus.stderr.trim(),
+          disk_df_root: diskDf.stdout.trim(),
+          launchd_services: launchd.stdout.trim(),
+          host_info: hostInfo.stdout.trim(),
+          sw_vers: swVers.stdout.trim(),
+          system_log_tail: syslog.stdout.trim(),
+          check_duration_ms: Date.now() - start,
+        };
+      }
 
       appendAudit({
         ts: new Date().toISOString(),
         tool: "health_check",
+        target,
         params_redacted: {},
-        duration_ms: summary.check_duration_ms,
+        duration_ms: summary.check_duration_ms as number,
         remote_addr: (extra as { remoteAddr?: string }).remoteAddr ?? "unknown",
       });
 
@@ -169,19 +198,20 @@ function createMcpServer(): McpServer {
   // ── Tool: restart_launchd_service ──────────────────────────────────────────
   server.tool(
     "restart_launchd_service",
-    "Restart a single launchd service on Sanborn Server using launchctl kickstart -k. Tries GUI domain first, falls back to system domain.",
+    "Restart a single launchd service on the selected target (default Sanborn) using launchctl kickstart -k. Tries GUI domain first, falls back to system domain.",
     {
       name: z
         .string()
         .describe(
           "Full launchd service name (e.g. com.forrest.mcp.gateway) or short suffix"
         ),
+      target: TargetParam,
     },
-    async ({ name }, extra) => {
+    async ({ name, target }, extra) => {
       const start = Date.now();
-      const uid = 504; // sanbornserver UID
+      const uid = uidFor(target);
+      const ssh = sshFor(target);
 
-      // Try gui domain first, then system domain
       const kickstartCmd = [
         `launchctl kickstart -k gui/${uid}/${name} 2>&1`,
         `&& echo "KICKED:gui/${uid}/${name}"`,
@@ -189,7 +219,7 @@ function createMcpServer(): McpServer {
         `|| echo "FAILED:could not kickstart ${name}"`,
       ].join(" ");
 
-      const kickResult = await runSsh(kickstartCmd, 15_000, sshCfg);
+      const kickResult = await runSsh(kickstartCmd, 15_000, ssh);
 
       // 2s delay then verify
       await new Promise((r) => setTimeout(r, 2000));
@@ -198,9 +228,10 @@ function createMcpServer(): McpServer {
         `|| launchctl print system/${name} 2>/dev/null | grep -E 'state|pid' | head -5`,
         `|| echo 'service not found in launchctl'`,
       ].join(" ");
-      const verifyResult = await runSsh(verifyCmd, 10_000, sshCfg);
+      const verifyResult = await runSsh(verifyCmd, 10_000, ssh);
 
       const result = {
+        target,
         service: name,
         kickstart_output: kickResult.stdout.trim(),
         kickstart_stderr: kickResult.stderr.trim(),
@@ -212,6 +243,7 @@ function createMcpServer(): McpServer {
       appendAudit({
         ts: new Date().toISOString(),
         tool: "restart_launchd_service",
+        target,
         params_redacted: { name },
         exit_code: kickResult.exit_code,
         duration_ms: result.duration_ms,
@@ -227,21 +259,40 @@ function createMcpServer(): McpServer {
   // ── Tool: restart_all ──────────────────────────────────────────────────────
   server.tool(
     "restart_all",
-    `Restart all canonical Sanborn services using launchctl kickstart -k. Mirrors the exact service list from the watchdog: ${CANONICAL_SERVICES.join(", ")}.`,
-    {},
-    async (_args, extra) => {
+    "Restart all canonical services on the selected target (default Sanborn) using launchctl kickstart -k. Each target has its own service list.",
+    {
+      target: TargetParam,
+    },
+    async ({ target }, extra) => {
       const start = Date.now();
-      const uid = 504; // sanbornserver UID
+      const uid = uidFor(target);
+      const ssh = sshFor(target);
+      const services = cfg.targets[target].canonicalServices;
+
+      if (!services || services.length === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                target,
+                error: `No canonical service list defined for '${target}'. Use restart_launchd_service to restart individual services by name.`,
+              }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
 
       const results: Array<{
         service: string;
         ok: boolean;
-        target: string;
+        domain: string;
         output: string;
         duration_ms: number;
       }> = [];
 
-      for (const service of CANONICAL_SERVICES) {
+      for (const service of services) {
         const svcStart = Date.now();
         const cmd = [
           `launchctl kickstart -k gui/${uid}/${service} 2>&1`,
@@ -249,14 +300,14 @@ function createMcpServer(): McpServer {
           `|| (launchctl kickstart -k system/${service} 2>&1 && echo "TARGET:system/${service}")`,
         ].join(" ");
 
-        const r = await runSsh(cmd, 12_000, sshCfg);
+        const r = await runSsh(cmd, 12_000, ssh);
         const combined = r.stdout + r.stderr;
         const targetMatch = combined.match(/TARGET:([\w/]+)/);
 
         results.push({
           service,
           ok: r.exit_code === 0,
-          target: targetMatch?.[1] ?? "unknown",
+          domain: targetMatch?.[1] ?? "unknown",
           output: combined.trim(),
           duration_ms: Date.now() - svcStart,
         });
@@ -265,6 +316,7 @@ function createMcpServer(): McpServer {
       appendAudit({
         ts: new Date().toISOString(),
         tool: "restart_all",
+        target,
         params_redacted: {},
         duration_ms: Date.now() - start,
         remote_addr: (extra as { remoteAddr?: string }).remoteAddr ?? "unknown",
@@ -274,7 +326,7 @@ function createMcpServer(): McpServer {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ results, total_duration_ms: Date.now() - start }, null, 2),
+            text: JSON.stringify({ target, results, total_duration_ms: Date.now() - start }, null, 2),
           },
         ],
       };
@@ -284,7 +336,7 @@ function createMcpServer(): McpServer {
   // ── Tool: reconnect_connector ──────────────────────────────────────────────
   server.tool(
     "reconnect_connector",
-    "Reconnect an MCP connector in claude.ai Settings → Connectors. Drives the logged-in Chrome profile (~/.claude-skills-profile) on Sanborn via ~/bin/claude-reconnect. Use to heal a registration-drop (tool vanishes mid-session while Sanborn watchdog is healthy). Server restarts do NOT fix claude.ai-leg drops — this tool does.",
+    "Reconnect an MCP connector in claude.ai Settings → Connectors. Sanborn-only — drives the logged-in Chrome profile on Sanborn via ~/bin/claude-reconnect.",
     {
       connector_name: z
         .string()
@@ -304,9 +356,36 @@ function createMcpServer(): McpServer {
         .describe(
           "If true, show what would be done without clicking anything. Default: false."
         ),
+      target: TargetParam,
     },
-    async ({ connector_name, reconnect_all = false, dry_run = false }, extra) => {
+    async ({ connector_name, reconnect_all = false, dry_run = false, target }, extra) => {
+      // reconnect_connector is Sanborn-only
+      if (target !== "sanborn") {
+        appendAudit({
+          ts: new Date().toISOString(),
+          tool: "reconnect_connector",
+          target,
+          params_redacted: { connector_name: connector_name ?? null, reconnect_all, dry_run },
+          exit_code: -1,
+          duration_ms: 0,
+          remote_addr: (extra as { remoteAddr?: string }).remoteAddr ?? "unknown",
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                error: "reconnect_connector is Sanborn-only. It drives Sanborn's Chrome profile and ~/bin/claude-reconnect. This tool cannot be used against Baedeker.",
+                target,
+              }, null, 2),
+            },
+          ],
+          isError: true,
+        };
+      }
+
       const start = Date.now();
+      const ssh = sshFor("sanborn");
 
       // Build the claude-reconnect invocation
       const parts: string[] = ["/Users/sanbornserver/bin/claude-reconnect"];
@@ -314,19 +393,15 @@ function createMcpServer(): McpServer {
       if (reconnect_all) {
         parts.push("--all");
       } else if (connector_name) {
-        // Shell-safe quoting: wrap name in single quotes, escape interior single quotes
         const safeName = connector_name.replace(/'/g, "'\\''");
         parts.push(`'${safeName}'`);
       }
 
-      // Capture stdout+stderr; emit exit code as last line
       const cmd = `${parts.join(" ")} 2>&1; echo "RECONNECT_EXIT:$?"`;
 
-      // Generous timeout: headed browser + 16 connectors can take ~3 min for --all
       const timeoutMs = reconnect_all ? 300_000 : 120_000;
-      const result = await runSsh(cmd, timeoutMs, sshCfg);
+      const result = await runSsh(cmd, timeoutMs, ssh);
 
-      // Parse exit code from sentinel line
       const exitMatch = result.stdout.match(/RECONNECT_EXIT:(\d+)\s*$/m);
       const reconnectExit = exitMatch ? parseInt(exitMatch[1], 10) : result.exit_code;
       const cleanOutput = result.stdout.replace(/RECONNECT_EXIT:\d+\s*$/m, "").trimEnd();
@@ -334,6 +409,7 @@ function createMcpServer(): McpServer {
       appendAudit({
         ts: new Date().toISOString(),
         tool: "reconnect_connector",
+        target,
         params_redacted: {
           connector_name: connector_name ?? null,
           reconnect_all,
@@ -350,6 +426,7 @@ function createMcpServer(): McpServer {
             type: "text",
             text: JSON.stringify(
               {
+                target,
                 connector_name: connector_name ?? null,
                 reconnect_all,
                 dry_run,
@@ -371,23 +448,24 @@ function createMcpServer(): McpServer {
   // ── Tool: tail_log ─────────────────────────────────────────────────────────
   server.tool(
     "tail_log",
-    "Tail a log file on Sanborn Server. Path must be under /tmp/, /var/log/, /Users/sanbornserver/.logs/, or /Users/sanbornserver/tmp/.",
+    "Tail a log file on the selected target (default Sanborn). Allowed path prefixes vary by target.",
     {
-      path: z.string().describe("Absolute path to log file on Sanborn Server"),
+      path: z.string().describe("Absolute path to log file on the target machine"),
       lines: z
         .number()
         .min(1)
         .max(500)
         .optional()
         .describe("Number of lines to return (default 50, max 500)"),
+      target: TargetParam,
     },
-    async ({ path: logPath, lines = 50 }, extra) => {
+    async ({ path: logPath, lines = 50, target }, extra) => {
       const start = Date.now();
+      const ssh = sshFor(target);
+      const prefixes = cfg.targets[target].logPathPrefixes;
 
       // Whitelist check
-      const allowed = LOG_PATH_PREFIXES.some((prefix) =>
-        logPath.startsWith(prefix)
-      );
+      const allowed = prefixes.some((prefix) => logPath.startsWith(prefix));
       if (!allowed) {
         return {
           content: [
@@ -395,7 +473,8 @@ function createMcpServer(): McpServer {
               type: "text",
               text: JSON.stringify({
                 error: "Path not allowed",
-                allowed_prefixes: LOG_PATH_PREFIXES,
+                target,
+                allowed_prefixes: prefixes,
                 path: logPath,
               }),
             },
@@ -405,15 +484,14 @@ function createMcpServer(): McpServer {
       }
 
       const safeLines = Math.min(lines, 500);
-      // Use printf to safely construct the path without shell injection
-      // (logPath is validated by whitelist above, but still avoid injection)
       const escapedPath = logPath.replace(/'/g, "'\\''");
       const cmd = `tail -n ${safeLines} '${escapedPath}' 2>&1`;
-      const result = await runSsh(cmd, 15_000, sshCfg);
+      const result = await runSsh(cmd, 15_000, ssh);
 
       appendAudit({
         ts: new Date().toISOString(),
         tool: "tail_log",
+        target,
         params_redacted: { path: logPath, lines: safeLines },
         exit_code: result.exit_code,
         duration_ms: Date.now() - start,
@@ -426,6 +504,7 @@ function createMcpServer(): McpServer {
             type: "text",
             text: JSON.stringify(
               {
+                target,
                 path: logPath,
                 lines_requested: safeLines,
                 exit_code: result.exit_code,
@@ -497,7 +576,10 @@ app.all("/mcp", requireBearer, async (req: Request, res: Response) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(cfg.port, "127.0.0.1", () => {
+  const targets = Object.entries(cfg.targets)
+    .map(([name, t]) => `${name}→${t.ssh.user}@${t.ssh.host}`)
+    .join(", ");
   console.error(
-    `[rescue-mcp] Listening on 127.0.0.1:${cfg.port}  ssh→${cfg.sshUser}@${cfg.sshHost}`
+    `[rescue-mcp] Listening on 127.0.0.1:${cfg.port}  targets: ${targets}`
   );
 });
