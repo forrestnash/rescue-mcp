@@ -4,6 +4,7 @@ import path from "node:path";
 export interface AuditEntry {
   ts: string;
   tool: string;
+  target?: string;
   params_redacted: Record<string, unknown>;
   exit_code?: number;
   duration_ms?: number;
