@@ -2,3 +2,16 @@ node_modules/
 dist/
 *.js.map
 .signup-creds
+
+# A job's result goes to the dispatch queue's result path, never into a repo
+# (vesper docs/SYSTEM-RULES.md, rule 3). Earlier results were moved to the queue
+# store on Sanborn: ~/.local/dispatch-queue/repo-results/<repo>/ (job 5429).
+DONE.md
+DONE-*.md
+DONE_*.md
+*-DONE.md
+*_DONE.md
+*-DONE-*.md
+QUESTIONS.md
+QUESTIONS-*.md
+*-QUESTIONS.md
